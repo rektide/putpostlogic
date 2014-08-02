@@ -1,0 +1,5 @@
+# putpostlogic extension
+comment = 'putpostlogic streamer'
+default_version = '__short_ver__'
+module_pathname = '$libdir/putpostlogic'
+relocatable = true
