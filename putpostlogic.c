@@ -206,6 +206,7 @@ static void
 startup_kafka(PutPostLogicDecodingData *data, char *brokers, char *topic)
 {
 	char errstr[512];
+	char default_brokers = 'localhost:9092';
 	rd_kafka_conf_t *conf = rd_kafka_conf_new();
 	rd_kafka_topic_conf_t *topic_conf = rd_kafka_topic_conf_new();
 	rd_kafka_t *rk;
@@ -251,6 +252,10 @@ startup_kafka(PutPostLogicDecodingData *data, char *brokers, char *topic)
 		ok = false;
 	}
 
+	if (brokers == NULL)
+	{
+		brokers = &default_brokers;
+	}
 	if (!ok || rd_kafka_brokers_add(rk, brokers) == 0) {
 		if (ok) ereport(ERROR,
 		                (errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
