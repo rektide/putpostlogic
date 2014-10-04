@@ -1,6 +1,7 @@
 #ifndef PUTPOSTLOGIC_H_
 #define PUTPOSTLOGIC_H_
 
+#include <time.h>
 #include "json-c/json.h"
 #include "librdkafka/rdkafka.h"
 
@@ -9,6 +10,8 @@
  */
 typedef struct
 {
+	struct timespec  *launch_time;
+	struct timespec  *txn_time;
 	bool              text_output;
 	bool              include_transaction;
 	bool              include_timestamp;

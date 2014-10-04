@@ -5,8 +5,8 @@ MODULE_big = putpostlogic
 OBJS = decode.o putpostlogic.o
 
 EXTENSION = putpostlogic
-PG_CPPFLAGS = $(pkg-config --cflags libnanomsg) $(pkg-config --cflags json-c)
-SHLIB_LIBS = $(pkg-config --libs libnanomsg) $(pkg-config --libs json-c) -lz -llibrdkafka
+PG_CPPFLAGS = $(pkg-config --cflags libnanomsg) $(pkg-config --cflags json-c) -Irt
+SHLIB_LIBS = $(pkg-config --libs libnanomsg) $(pkg-config --libs json-c) -lz -llibrdkafka -lrt
 
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

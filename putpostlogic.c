@@ -43,6 +43,8 @@
 #include "putpostlogic.h"
 #include "decode.h"
 
+#include "time.h"
+
 PG_MODULE_MAGIC;
 
 /* These must be available to pg_dlsym() */
@@ -55,6 +57,7 @@ static void ppl_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn);
 static void ppl_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr commit_lsn);
 static void ppl_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation rel, ReorderBufferChange *change);
 
+static double time_diff(struct timespec *current, struct timespec *old);
 static char** startup_numstrings();
 static void startup_kafka(PutPostLogicDecodingData *data, char *brokers, char *topic);
 static int startup_nanomsg(char *url, int nn_protocol, bool bind);
@@ -106,6 +109,12 @@ startup_numstrings()
 	return numstrings;
 }
 
+static double
+time_diff(struct timespec *current, struct timespec *old)
+{
+	return ((current->tv_sec - old->tv_sec) * 1.0e-9) + (current->tv_nsec - old->tv_nsec);
+}
+
 /* initialize this plugin */
 static void
 ppl_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_init)
@@ -123,6 +132,8 @@ ppl_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_init)
 	bool nanomsg_push_bind = false;
 
 	data = palloc(sizeof(PutPostLogicDecodingData));
+	data->launch_time = palloc(sizeof(struct timespec));
+	data->txn_time = palloc(sizeof(struct timespec));
 	data->text_output = true;
 	data->include_transaction = false;
 	data->include_timestamp = false;
@@ -137,6 +148,8 @@ ppl_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_init)
 	data->numstrings = startup_numstrings();
 	ctx->output_plugin_private = data;
 	opt->output_type = OUTPUT_PLUGIN_TEXTUAL_OUTPUT;
+
+	clock_gettime(CLOCK_MONOTONIC, data->launch_time);
 
 	foreach(option, ctx->output_plugin_options)
 	{
@@ -436,12 +449,18 @@ static void
 ppl_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 {
 	PutPostLogicDecodingData *data = ctx->output_plugin_private;
+
 	data->json = json_object_new_object();
 
 	if (data->include_transaction)
 	{
-		json_object* xid = json_object_new_int(txn->xid);
-		json_object_object_add(data->json, "_xid", xid);
+		json_object *xid = json_object_new_int(txn->xid);
+		json_object_object_add(data->json, "@xid", xid);
+	}
+
+	if (data->include_timestamp)
+	{
+		clock_gettime(CLOCK_MONOTONIC, data->txn_time);
 	}
 
 	if (data->json_topic != NULL)
@@ -461,8 +480,23 @@ static void
 ppl_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr commit_lsn)
 {
 	PutPostLogicDecodingData *data = ctx->output_plugin_private;
-	const char *json = json_object_to_json_string(data->json);
-	int len = strlen(json);
+	const char               *json = json_object_to_json_string(data->json);
+	int                       len = strlen(json);
+
+	if (data->include_timestamp)
+	{
+		struct timespec end = {0,0};
+		json_object *time_start, *time_duration;
+		clock_gettime(CLOCK_MONOTONIC, &end);
+
+		time_start = json_object_new_double(time_diff(data->txn_time, data->launch_time));
+		json_object_object_add(data->json, "@ts", time_start);
+		time_duration = json_object_new_double(time_diff(&end, data->txn_time));
+		json_object_object_add(data->json, "@td", time_duration);
+	}
+
+	json = json_object_to_json_string(data->json);
+	len = strlen(json);
 
 	if (data->text_output) {
 		OutputPluginPrepareWrite(ctx, true);
