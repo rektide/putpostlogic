@@ -1,13 +1,14 @@
 /*-------------------------------------------------------------------------
  *
- * ppl_raw.c
- *		Logical decoding output plugin generating SQL queries based
- *		on things decoded.
+ * putpostlogic.c
+ *		Logical decoding output plugin generating JSON records of changes /w
+ *		additional (Kafka and Nanomsg) output capabilities
  *
  * Copyright (c) 2012-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2014, rektide de la faye
  *
  * IDENTIFICATION
- *		  ppl_raw/ppl_raw.c
+ *		  putpostlogic.c
  *
  *-------------------------------------------------------------------------
  */
@@ -48,29 +49,13 @@ PG_MODULE_MAGIC;
 extern void _PG_init(void);
 extern void _PG_output_plugin_init(OutputPluginCallbacks *cb);
 
-/*
- * Structure storing the plugin specifications and options.
- */
-typedef struct
-{
-	bool              text_output;
-	bool              include_transaction;
-	bool              include_timestamp;
-	json_object      *json;
-	rd_kafka_t       *kafka;
-	rd_kafka_topic_t *kafka_topic;
-	int               nanomsg_pair; // nn_pair socket
-	int               nanomsg_pub; // nn_pub socket
-	int               nanomsg_pub_topic;
-	int               nanomsg_push; // nn_push socket
-} PutPostLogicDecodingData;
+static void ppl_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_init);
+static void ppl_shutdown(LogicalDecodingContext *ctx);
+static void ppl_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn);
+static void ppl_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr commit_lsn);
+static void ppl_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation rel, ReorderBufferChange *change);
 
-static void ppl_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_init);
-static void ppl_raw_shutdown(LogicalDecodingContext *ctx);
-static void ppl_raw_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn);
-static void ppl_raw_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr commit_lsn);
-static void ppl_raw_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation rel, ReorderBufferChange *change);
-
+static char** startup_numstrings();
 static void startup_kafka(PutPostLogicDecodingData *data, char *brokers, char *topic);
 static int startup_nanomsg(char *url, int nn_protocol, bool bind);
 
@@ -88,30 +73,52 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 {
 	AssertVariableIsOfType(&_PG_output_plugin_init, LogicalOutputPluginInit);
 
-	cb->startup_cb = ppl_raw_startup;
-	cb->begin_cb = ppl_raw_begin_txn;
-	cb->change_cb = ppl_raw_change;
-	cb->commit_cb = ppl_raw_commit_txn;
-	cb->shutdown_cb = ppl_raw_shutdown;
+	cb->startup_cb = ppl_startup;
+	cb->begin_cb = ppl_begin_txn;
+	cb->change_cb = ppl_change;
+	cb->commit_cb = ppl_commit_txn;
+	cb->shutdown_cb = ppl_shutdown;
 }
 
+static char **numstrings = NULL;
+
+static char **
+startup_numstrings()
+{
+	if (numstrings == NULL)
+	{
+		char numstring[15];
+		int  len;
+		int  i = 0;
+
+		numstrings = palloc(sizeof(char*) * 65536);
+		if (numstrings[0] == 0)
+		{
+			for(i = 0; i < 2 << 15; ++i)
+			{
+				sprintf(numstring, "%d", i);
+				len = strlen(numstring);
+				numstrings[i] = palloc(len+1);
+				strcpy(numstrings[i], numstring);
+			}
+		}
+	}
+	return numstrings;
+}
 
 /* initialize this plugin */
 static void
-ppl_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_init)
+ppl_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_init)
 {
 	ListCell *option;
 	PutPostLogicDecodingData *data;
 	char *kafka_topic = NULL;
 	char *kafka_brokers = NULL;
-
 	char *nanomsg_pair = NULL;
 	bool nanomsg_pair_bind = false;
-
 	char *nanomsg_pub = NULL;
 	char *nanomsg_pub_topic = NULL;
 	bool nanomsg_pub_bind = false;
-
 	char *nanomsg_push = NULL;
 	bool nanomsg_push_bind = false;
 
@@ -119,12 +126,15 @@ ppl_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_i
 	data->text_output = true;
 	data->include_transaction = false;
 	data->include_timestamp = false;
+	data->json = NULL;
+	data->json_iter = -1;
+	data->json_topic = NULL;
 	data->kafka = NULL;
 	data->kafka_topic = NULL;
 	data->nanomsg_pair = -1;
 	data->nanomsg_pub = -1;
-	data->nanomsg_pub_topic = NULL;
 	data->nanomsg_push = -1;
+	data->numstrings = startup_numstrings();
 	ctx->output_plugin_private = data;
 	opt->output_type = OUTPUT_PLUGIN_TEXTUAL_OUTPUT;
 
@@ -230,6 +240,18 @@ ppl_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_i
 				validArgs = false;
 			}
 		}
+		else if (strcmp(elem->defname, "json-topic") == 0)
+		{
+			if (elem->arg != NULL)
+			{
+				char *val = strVal(elem->arg);
+				data->json_topic = json_object_new_string(val);
+			}
+			else
+			{
+				validArgs = false;
+			}
+		}
 		else
 		{
 			ereport(ERROR,
@@ -248,7 +270,7 @@ ppl_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_i
 		else if (dest != NULL)
 		{
 			char* val = strVal(elem->arg);
-			*dest = malloc(strlen(val));
+			*dest = palloc(strlen(val));
 			strcpy(*dest, val);
 		}
 
@@ -258,20 +280,14 @@ ppl_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_i
 	{
 		startup_kafka(data, kafka_brokers, kafka_topic);
 	}
-
 	if (nanomsg_pair != NULL)
 	{
 		data->nanomsg_pair = startup_nanomsg(nanomsg_pair, NN_PAIR, nanomsg_pair_bind);
 	}
-
 	if (nanomsg_pub != NULL)
 	{
 		data->nanomsg_pub = startup_nanomsg(nanomsg_pub, NN_PUB, nanomsg_pub_bind);
-		if (nanomsg_pub_topic) {
-			data->nanomsg_pub_topic = nanomsg_pub_topic;
-		}
 	}
-
 	if (nanomsg_push != NULL)
 	{
 		data->nanomsg_push = startup_nanomsg(nanomsg_push, NN_PUSH, nanomsg_push_bind);
@@ -318,7 +334,7 @@ startup_kafka(PutPostLogicDecodingData *data, char *brokers, char *topic)
 
 	if (brokers == NULL)
 	{
-		brokers = &default_brokers;
+		brokers = default_brokers;
 	}
 
 	rd_kafka_conf_set_opaque(conf, data);
@@ -368,8 +384,6 @@ startup_kafka(PutPostLogicDecodingData *data, char *brokers, char *topic)
 		ok = false;
 	}
 
-
-
 	if (ok)
 	{
 		data->kafka = rk;
@@ -392,10 +406,10 @@ startup_kafka(PutPostLogicDecodingData *data, char *brokers, char *topic)
 
 /* cleanup this plugin's resources */
 static void
-ppl_raw_shutdown(LogicalDecodingContext *ctx)
+ppl_shutdown(LogicalDecodingContext *ctx)
 {
 	PutPostLogicDecodingData *data = ctx->output_plugin_private;
-	int wait = 5000;
+	int wait = 20000;
 
 	nn_term();
 
@@ -413,11 +427,13 @@ ppl_raw_shutdown(LogicalDecodingContext *ctx)
 		rd_kafka_destroy(data->kafka);
 		rd_kafka_wait_destroyed(2000);
 	}
+
+	json_object_put(data->json_topic);
 }
 
 /* BEGIN callback */
 static void
-ppl_raw_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
+ppl_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 {
 	PutPostLogicDecodingData *data = ctx->output_plugin_private;
 	data->json = json_object_new_object();
@@ -428,18 +444,25 @@ ppl_raw_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 		json_object_object_add(data->json, "_xid", xid);
 	}
 
+	if (data->json_topic != NULL)
+	{
+		json_object_get(data->json_topic);
+		json_object_object_add(data->json, "_topic", data->json_topic);
+	}
+
+	data->json_iter = 0;
+
 	// Drain kafka events
 	rd_kafka_poll(data->kafka, 0);
 }
 
 /* COMMIT callback */
 static void
-ppl_raw_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr commit_lsn)
+ppl_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr commit_lsn)
 {
 	PutPostLogicDecodingData *data = ctx->output_plugin_private;
 	const char *json = json_object_to_json_string(data->json);
 	int len = strlen(json);
-	json_object_put(data->json);
 
 	if (data->text_output) {
 		OutputPluginPrepareWrite(ctx, true);
@@ -460,7 +483,7 @@ ppl_raw_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPt
 
 	if (data->kafka_topic != NULL)
 	{
-		rd_kafka_produce(data->kafka_topic, RD_KAFKA_PARTITION_UA, RD_KAFKA_MSG_F_COPY, json, len, NULL, 0, data->json);
+		rd_kafka_produce(data->kafka_topic, RD_KAFKA_PARTITION_UA, RD_KAFKA_MSG_F_COPY, (char *)json, len, NULL, 0, data->json);
 	}
 	else
 	{
@@ -480,14 +503,11 @@ txn_json_put_cb (rd_kafka_t *rk, void *payload, size_t len, rd_kafka_resp_err_t 
  * Callback for individual changed tuples
  */
 static void
-ppl_raw_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation relation, ReorderBufferChange *change)
+ppl_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation relation, ReorderBufferChange *change)
 {
-	PutPostLogicDecodingData* data;
-	MemoryContext	old;
+	//MemoryContext	old;
 	char			replident = relation->rd_rel->relreplident;
 	bool			is_rel_non_selective;
-
-	data = ctx->output_plugin_private;
 
 	/*
 	 * Determine if relation is selective enough for WHERE clause generation
@@ -500,17 +520,12 @@ ppl_raw_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation rela
 							(replident == REPLICA_IDENTITY_DEFAULT &&
 							 !OidIsValid(relation->rd_replidindex)));
 
-	/* Decode entry depending on its type */
 	switch (change->action)
 	{
 		case REORDER_BUFFER_CHANGE_INSERT:
 			if (change->data.tp.newtuple != NULL)
 			{
-				OutputPluginPrepareWrite(ctx, true);
-				ppl_raw_insert(ctx->out,
-								   relation,
-								   &change->data.tp.newtuple->tuple);
-				OutputPluginWrite(ctx, true);
+				ppl_insert(ctx, relation, &change->data.tp.newtuple->tuple);
 			}
 			break;
 		case REORDER_BUFFER_CHANGE_UPDATE:
@@ -521,22 +536,14 @@ ppl_raw_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation rela
 				HeapTuple newtuple = change->data.tp.newtuple != NULL ?
 					&change->data.tp.newtuple->tuple : NULL;
 
-				OutputPluginPrepareWrite(ctx, true);
-				ppl_raw_update(ctx->out,
-								   relation,
-								   oldtuple,
-								   newtuple);
-				OutputPluginWrite(ctx, true);
+				ppl_update(ctx, relation, oldtuple, newtuple);
+
 			}
 			break;
 		case REORDER_BUFFER_CHANGE_DELETE:
 			if (!is_rel_non_selective)
 			{
-				OutputPluginPrepareWrite(ctx, true);
-				ppl_raw_delete(ctx->out,
-								   relation,
-								   &change->data.tp.oldtuple->tuple);
-				OutputPluginWrite(ctx, true);
+				ppl_delete(ctx, relation, &change->data.tp.oldtuple->tuple);
 			}
 			break;
 		default:
