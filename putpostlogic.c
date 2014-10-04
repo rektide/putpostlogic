@@ -34,6 +34,8 @@
 
 #include "json-c/json.h"
 #include "nanomsg/nn.h"
+#include "nanomsg/pair.h"
+#include "nanomsg/pubsub.h"
 #include "nanomsg/pipeline.h"
 #include "librdkafka/rdkafka.h"
 
@@ -57,7 +59,10 @@ typedef struct
 	json_object      *json;
 	rd_kafka_t       *kafka;
 	rd_kafka_topic_t *kafka_topic;
-	int               nanomsg_socket;
+	int               nanomsg_pair; // nn_pair socket
+	int               nanomsg_pub; // nn_pub socket
+	int               nanomsg_pub_topic;
+	int               nanomsg_push; // nn_push socket
 } PutPostLogicDecodingData;
 
 static void ppl_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_init);
@@ -67,7 +72,9 @@ static void ppl_raw_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *tx
 static void ppl_raw_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relation rel, ReorderBufferChange *change);
 
 static void startup_kafka(PutPostLogicDecodingData *data, char *brokers, char *topic);
-static void startup_nanomsg(PutPostLogicDecodingData *data, char *url);
+static int startup_nanomsg(char *url, int nn_protocol, bool bind);
+
+static void txn_json_put_cb (rd_kafka_t *rk, void *payload, size_t len, rd_kafka_resp_err_t err, void *opaque, void *msg_opaque);
 
 void
 _PG_init(void)
@@ -95,9 +102,18 @@ ppl_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_i
 {
 	ListCell *option;
 	PutPostLogicDecodingData *data;
-	char *kafka_topic;
-	char *kafka_brokers;
-	char *nanomsg_url;
+	char *kafka_topic = NULL;
+	char *kafka_brokers = NULL;
+
+	char *nanomsg_pair = NULL;
+	bool nanomsg_pair_bind = false;
+
+	char *nanomsg_pub = NULL;
+	char *nanomsg_pub_topic = NULL;
+	bool nanomsg_pub_bind = false;
+
+	char *nanomsg_push = NULL;
+	bool nanomsg_push_bind = false;
 
 	data = palloc(sizeof(PutPostLogicDecodingData));
 	data->text_output = true;
@@ -105,7 +121,10 @@ ppl_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_i
 	data->include_timestamp = false;
 	data->kafka = NULL;
 	data->kafka_topic = NULL;
-	data->nanomsg_socket = -1;
+	data->nanomsg_pair = -1;
+	data->nanomsg_pub = -1;
+	data->nanomsg_pub_topic = NULL;
+	data->nanomsg_push = -1;
 	ctx->output_plugin_private = data;
 	opt->output_type = OUTPUT_PLUGIN_TEXTUAL_OUTPUT;
 
@@ -132,16 +151,61 @@ ppl_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_i
 				validArgs = false;
 			}
 		}
-		else if (strcmp(elem->defname, "nanomsg-url") == 0)
+		else if (strcmp(elem->defname, "nanomsg-pair") == 0)
 		{
 			if (elem->arg != NULL)
 			{
-				dest = &nanomsg_url;
+				dest = &nanomsg_pair;
 			}
 			else
 			{
 				validArgs = false;
 			}
+		}
+		else if (strcmp(elem->defname, "nanomsg-pair-bind") == 0)
+		{
+			nanomsg_pair_bind = true;
+		}
+		else if (strcmp(elem->defname, "nanomsg-pub") == 0)
+		{
+			if (elem->arg != NULL)
+			{
+				dest = &nanomsg_pub;
+			}
+			else
+			{
+				validArgs = false;
+			}
+		}
+		else if (strcmp(elem->defname, "nanomsg-pub-topic") == 0)
+		{
+			if (elem->arg != NULL)
+			{
+				dest = &nanomsg_pub_topic;
+			}
+			else
+			{
+				validArgs = false;
+			}
+		}
+		else if (strcmp(elem->defname, "nanomsg-pub-bind") == 0)
+		{
+			nanomsg_pub_bind = true;
+		}
+		else if (strcmp(elem->defname, "nanomsg-push") == 0)
+		{
+			if (elem->arg != NULL)
+			{
+				dest = &nanomsg_push;
+			}
+			else
+			{
+				validArgs = false;
+			}
+		}
+		else if (strcmp(elem->defname, "nanomsg-push-bind") == 0)
+		{
+			nanomsg_push_bind = true;
 		}
 		else if (strcmp(elem->defname, "kafka-topic") == 0)
 		{
@@ -186,7 +250,6 @@ ppl_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_i
 			char* val = strVal(elem->arg);
 			*dest = malloc(strlen(val));
 			strcpy(*dest, val);
-
 		}
 
 	}
@@ -196,17 +259,46 @@ ppl_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_i
 		startup_kafka(data, kafka_brokers, kafka_topic);
 	}
 
-	if (nanomsg_url != NULL)
+	if (nanomsg_pair != NULL)
 	{
-		startup_nanomsg(data, nanomsg_url);
+		data->nanomsg_pair = startup_nanomsg(nanomsg_pair, NN_PAIR, nanomsg_pair_bind);
 	}
+
+	if (nanomsg_pub != NULL)
+	{
+		data->nanomsg_pub = startup_nanomsg(nanomsg_pub, NN_PUB, nanomsg_pub_bind);
+		if (nanomsg_pub_topic) {
+			data->nanomsg_pub_topic = nanomsg_pub_topic;
+		}
+	}
+
+	if (nanomsg_push != NULL)
+	{
+		data->nanomsg_push = startup_nanomsg(nanomsg_push, NN_PUSH, nanomsg_push_bind);
+	}
+}
+
+static int
+startup_nanomsg(char *url, int nn_protocol, bool bind)
+{
+	int socket = nn_socket(AF_SP, nn_protocol);
+	if (socket >= 0) {
+		if (bind) {
+			nn_bind(socket, url);
+		}
+		else
+		{
+			nn_connect(socket, url);
+		}
+	}
+	return socket;
 }
 
 static void
 startup_kafka(PutPostLogicDecodingData *data, char *brokers, char *topic)
 {
 	char errstr[512];
-	char default_brokers = 'localhost:9092';
+	char default_brokers[] = "localhost:9092";
 	rd_kafka_conf_t *conf = rd_kafka_conf_new();
 	rd_kafka_topic_conf_t *topic_conf = rd_kafka_topic_conf_new();
 	rd_kafka_t *rk;
@@ -223,6 +315,15 @@ startup_kafka(PutPostLogicDecodingData *data, char *brokers, char *topic)
 
 	bool ok = true;
 
+
+	if (brokers == NULL)
+	{
+		brokers = &default_brokers;
+	}
+
+	rd_kafka_conf_set_opaque(conf, data);
+	rd_kafka_conf_set_dr_cb(conf, &txn_json_put_cb);
+
 	for (i = 0; i < global_len; ++i)
 	{
 		if (rd_kafka_conf_set(conf, global_keys[i], global_values[i], errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK)
@@ -235,7 +336,7 @@ startup_kafka(PutPostLogicDecodingData *data, char *brokers, char *topic)
 	}
 	for (i = 0; i < topic_len; ++i)
 	{
-		if (rd_kafka_topic_conf_set(conf, topic_keys[i], topic_values[i], errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK)
+		if (ok && rd_kafka_topic_conf_set(topic_conf, topic_keys[i], topic_values[i], errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK)
 		{
 			ereport(ERROR,
 			        (errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
@@ -244,53 +345,48 @@ startup_kafka(PutPostLogicDecodingData *data, char *brokers, char *topic)
 		}
 	}
 
-	if (!ok || !(rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr))))
+	if (ok && (rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr))) == 0)
 	{
-		if (ok) ereport(ERROR,
-		                 (errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
-		                  errmsg("kafka producer create failed: \"%s\"", (char*)&errstr)));
+		ereport(ERROR,
+		        (errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
+		         errmsg("kafka producer create failed: \"%s\"", (char*)&errstr)));
 		ok = false;
 	}
 
-	if (brokers == NULL)
+	if (ok && rd_kafka_brokers_add(rk, brokers) == 0)
 	{
-		brokers = &default_brokers;
+		ereport(ERROR,
+		        (errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
+		         errmsg("kafka broker add failed, \"%s\" resulted in: %s", brokers, (char*)&errstr)));
+		ok = false;
 	}
-	if (!ok || rd_kafka_brokers_add(rk, brokers) == 0) {
-		if (ok) ereport(ERROR,
-		                (errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
-		                 errmsg("kafka broker add failed, \"%s\" resulted in:", brokers, (char*)&errstr)));
+	if (ok && (rkt = rd_kafka_topic_new(rk, topic, topic_conf)) == 0)
+	{
+		ereport(ERROR,
+		        (errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
+		         errmsg("kafka topic add failed, \"%s\" resulted in: %s", brokers, (char*)&errstr)));
 		ok = false;
 	}
 
-	/* Create topic */
-	if (ok) {
-		rkt = rd_kafka_topic_new(rk, topic, topic_conf);
-		if(rkt)
+
+
+	if (ok)
+	{
+		data->kafka = rk;
+		data->kafka_topic = rkt;
+	}
+	else
+	{
+		if (rkt)
 		{
-			data->kafka = rk;
-			data->kafka_topic = rkt;
+			rd_kafka_topic_destroy(rkt);
 		}
-		else
+		if (rk)
 		{
 			rd_kafka_destroy(rk);
-			ok = false;
 		}
-	}
-}
-
-static void
-startup_nanomsg(PutPostLogicDecodingData *data, char *url)
-{
-	bool ok = true;
-	int socket = nn_socket(AF_SP, NN_PUSH);
-	if (socket == 0)
-	{
-		ok = false;
-	}
-	else if (nn_connect (socket, url) >= 0)
-	{
-		data->nanomsg_socket = socket;
+		rd_kafka_topic_conf_destroy(topic_conf);
+		rd_kafka_conf_destroy(conf);
 	}
 }
 
@@ -301,10 +397,7 @@ ppl_raw_shutdown(LogicalDecodingContext *ctx)
 	PutPostLogicDecodingData *data = ctx->output_plugin_private;
 	int wait = 5000;
 
-	if (data->nanomsg_socket)
-	{
-		nn_shutdown(data->nanomsg_socket, 0);
-	}
+	nn_term();
 
 	while (data->kafka && wait > 0 && rd_kafka_outq_len(data->kafka) > 0)
 	{
@@ -313,7 +406,7 @@ ppl_raw_shutdown(LogicalDecodingContext *ctx)
 	}
 	if (data->kafka_topic)
 	{
-		rd_kafka_topic_conf_destroy(data->kafka_topic);
+		rd_kafka_topic_destroy(data->kafka_topic);
 	}
 	if (data->kafka)
 	{
@@ -334,6 +427,9 @@ ppl_raw_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 		json_object* xid = json_object_new_int(txn->xid);
 		json_object_object_add(data->json, "_xid", xid);
 	}
+
+	// Drain kafka events
+	rd_kafka_poll(data->kafka, 0);
 }
 
 /* COMMIT callback */
@@ -341,7 +437,7 @@ static void
 ppl_raw_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr commit_lsn)
 {
 	PutPostLogicDecodingData *data = ctx->output_plugin_private;
-	char *json = json_object_to_json_string(data->json);
+	const char *json = json_object_to_json_string(data->json);
 	int len = strlen(json);
 	json_object_put(data->json);
 
@@ -351,17 +447,33 @@ ppl_raw_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPt
 		OutputPluginWrite(ctx, true);
 	}
 
-	if (data->nanomsg_socket > 0)
-	{
-		int bytes = nn_send(data->nanomsg_socket, json, len, 0);
+	if (data->nanomsg_pair >= 0) {
+		nn_send(data->nanomsg_pair, json, len, 0);
+	}
+	if (data->nanomsg_pub >= 0) {
+		nn_send(data->nanomsg_pub, json, len, 0);
+	}
+
+	if (data->nanomsg_push >= 0) {
+		nn_send(data->nanomsg_push, json, len, 0);
 	}
 
 	if (data->kafka_topic != NULL)
 	{
-		int status = rd_kafka_produce(data->kafka_topic, RD_KAFKA_PARTITION_UA, RD_KAFKA_MSG_F_FREE, json, len, NULL, 0, NULL);
-	} else {
-		free(json);
+		rd_kafka_produce(data->kafka_topic, RD_KAFKA_PARTITION_UA, RD_KAFKA_MSG_F_COPY, json, len, NULL, 0, data->json);
 	}
+	else
+	{
+		json_object_put(data->json);
+	}
+	data->json = NULL;
+}
+
+/* Completion callback */
+static void
+txn_json_put_cb (rd_kafka_t *rk, void *payload, size_t len, rd_kafka_resp_err_t err, void *opaque, void *msg_opaque)
+{
+	json_object_put(msg_opaque);
 }
 
 /*
