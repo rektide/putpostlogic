@@ -2,7 +2,7 @@ short_ver = 0.1.0
 long_ver = $(short_ver)-$(shell git describe --long 2>/dev/null || echo unknown)
 
 MODULE_big = putpostlogic
-OBJS = putpostlogic.o
+OBJS = decode.o putpostlogic.o
 
 EXTENSION = putpostlogic
 PG_CPPFLAGS = $(pkg-config --cflags libnanomsg) $(pkg-config --cflags json-c)
